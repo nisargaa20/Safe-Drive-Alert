@@ -7,7 +7,6 @@ import imutils
 import time
 import dlib
 import cv2
-import os
 from pygame import mixer  # pip install pygame
 from datetime import datetime
 
@@ -53,6 +52,25 @@ def is_nodding(nose_y_hist, nod_thresh=5, min_nods=2):
         nodding = True
     return nodding
 
+def is_head_turned(shape):
+    # Extract relevant facial landmarks
+    left_eye_center = np.mean(shape[36:42], axis=0)
+    right_eye_center = np.mean(shape[42:48], axis=0)
+    nose_tip = shape[33]
+
+    # Calculate distances from nose tip to eye centers
+    left_distance = np.linalg.norm(left_eye_center - nose_tip)
+    right_distance = np.linalg.norm(right_eye_center - nose_tip)
+
+    # Define a threshold for what constitutes 'looking sideways'
+    sideways_threshold = 1.5  # Adjust based on your observations
+
+    # Check if either eye is significantly further away from the nose tip
+    if left_distance > sideways_threshold * right_distance or right_distance > sideways_threshold * left_distance:
+        return True
+    else:
+        return False
+
 ap = argparse.ArgumentParser()
 ap.add_argument("-w", "--webcam", type=int, default=0,
                 help="index of webcam on system")
@@ -62,18 +80,20 @@ EYE_AR_THRESH = 0.3
 EYE_AR_CONSEC_FRAMES = 30
 YAWN_THRESH = 20
 NOD_THRESH = 5  # Reduced threshold for more sensitivity
-MIN_NODS = 2  # Minimum nods detected
+MIN_NODS = 5  # Minimum nods detected
 NO_BLINK_DURATION = 10  # Duration in seconds to consider no blinking
+SIDESWAY_ALERT_DURATION = 2  # Duration in seconds to trigger sideways alert
 
 alarm_status = False
 alarm_status2 = False
 saying = False
 COUNTER = 0
+sideways_timer = None
 nose_y_hist = []
 open_eyes_start_time = None
 
 print("-> Loading the predictor and detector...")
-detector = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
 
 print("-> Starting Video Stream")
@@ -86,72 +106,86 @@ while True:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     rects = detector.detectMultiScale(gray, scaleFactor=1.1,
-        minNeighbors=5, minSize=(30, 30),
-        flags=cv2.CASCADE_SCALE_IMAGE)
+                                      minNeighbors=5, minSize=(30, 30),
+                                      flags=cv2.CASCADE_SCALE_IMAGE)
 
-    for (x, y, w, h) in rects:
-        rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
+    # Check if any faces are detected
+    if len(rects) > 0:
+        for (x, y, w, h) in rects:
+            rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
 
-        shape = predictor(gray, rect)
-        shape = face_utils.shape_to_np(shape)
+            shape = predictor(gray, rect)
+            shape = face_utils.shape_to_np(shape)
 
-        eye = final_ear(shape)
-        ear = eye[0]
-        leftEye = eye[1]
-        rightEye = eye[2]
+            eye = final_ear(shape)
+            ear = eye[0]
+            leftEye = eye[1]
+            rightEye = eye[2]
 
-        distance = lip_distance(shape)
-        nose_y = shape[33][1]  # Nose tip y-coordinate
+            distance = lip_distance(shape)
+            nose_y = shape[33][1]  # Nose tip y-coordinate
 
-        leftEyeHull = cv2.convexHull(leftEye)
-        rightEyeHull = cv2.convexHull(rightEye)
-        cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
-        cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
+            leftEyeHull = cv2.convexHull(leftEye)
+            rightEyeHull = cv2.convexHull(rightEye)
+            cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
+            cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
 
-        lip = shape[48:60]
-        cv2.drawContours(frame, [lip], -1, (0, 255, 0), 1)
+            lip = shape[48:60]
+            cv2.drawContours(frame, [lip], -1, (0, 255, 0), 1)
 
-        if ear < EYE_AR_THRESH:
-            COUNTER += 1
-            open_eyes_start_time = None
-            if COUNTER >= EYE_AR_CONSEC_FRAMES:
-                cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
+            if ear < EYE_AR_THRESH and not is_head_turned(shape):
+                COUNTER += 1
+                open_eyes_start_time = None
+                if COUNTER >= EYE_AR_CONSEC_FRAMES:
+                    cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if not mixer.music.get_busy():
+                        mixer.music.play()
+            else:
+                if open_eyes_start_time is None:
+                    open_eyes_start_time = datetime.now()
+                elif (datetime.now() - open_eyes_start_time).total_seconds() > NO_BLINK_DURATION and not is_head_turned(shape):
+                    cv2.putText(frame, "NO BLINKING ALERT!", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if not mixer.music.get_busy():
+                        mixer.music.play()
+                COUNTER = 0
+
+            if distance > YAWN_THRESH:
+                cv2.putText(frame, "Yawn Alert", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 if not mixer.music.get_busy():
                     mixer.music.play()
-        else:
-            if open_eyes_start_time is None:
-                open_eyes_start_time = datetime.now()
-            elif (datetime.now() - open_eyes_start_time).total_seconds() > NO_BLINK_DURATION:
-                cv2.putText(frame, "NO BLINKING ALERT!", (10, 90),
+            else:
+                cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(frame, "YAWN: {:.2f}".format(distance), (300, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Nodding detection
+            nose_y_hist.append(nose_y)
+            if len(nose_y_hist) > 10:  # Maintain a history of the last 10 y-coordinates
+                nose_y_hist.pop(0)
+
+            if is_nodding(nose_y_hist, NOD_THRESH, MIN_NODS):
+                cv2.putText(frame, "NODDING ALERT!", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 if not mixer.music.get_busy():
                     mixer.music.play()
-            COUNTER = 0
-            alarm_status = False
 
-        if distance > YAWN_THRESH:
-            cv2.putText(frame, "Yawn Alert", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            if not mixer.music.get_busy():
-                mixer.music.play()
-        else:
-            cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(frame, "YAWN: {:.2f}".format(distance), (300, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-        # Nodding detection
-        nose_y_hist.append(nose_y)
-        if len(nose_y_hist) > 10:  # Maintain a history of the last 10 y-coordinates
-            nose_y_hist.pop(0)
-
-        if is_nodding(nose_y_hist, NOD_THRESH, MIN_NODS):
-            cv2.putText(frame, "NODDING ALERT!", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            if not mixer.music.get_busy():
-                mixer.music.play()
-
+            # Check if the driver is looking sideways
+            if is_head_turned(shape):
+                if sideways_timer is None:
+                    sideways_timer = datetime.now()
+                elif (datetime.now() - sideways_timer).total_seconds() > SIDESWAY_ALERT_DURATION:
+                    cv2.putText(frame, "LOOKING SIDEWAYS FOR TOO LONG!", (10, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if not mixer.music.get_busy():
+                        mixer.music.play()
+            else:
+                sideways_timer = None  # Reset timer if not looking sideways
+                cv2.putText(frame, "HEAD STRAIGHT", (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     cv2.imshow("Frame", frame)
     key = cv2.waitKey(1) & 0xFF
 
